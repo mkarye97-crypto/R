@@ -3,7 +3,7 @@
 Answers are suggestions from an unofficial source; every chapter result is checked
 against QUREO. Unknown/ambiguous questions are left unanswered, never guessed.
 """
-import json, re, time, unicodedata
+import json, re, time, unicodedata, difflib
 from pathlib import Path
 import main as core
 
@@ -67,6 +67,51 @@ def norm(s):
     s = re.sub(r"\[\[/?(?:bdi|bold|italic|underline|copy)[^\]]*\]\]", " ", s)
     s = re.sub(r"<[^>]+>", " ", s)
     return re.sub(r"\s+", " ", re.sub(r"[^\w\u0600-\u06ff]+", " ", s)).strip()
+
+
+
+def content_similarity(live_q, dbrow):
+    """Compare question meaning/content; question IDs and displayed numbers are not trusted."""
+    live_parts = [live_q.get("content", "")]
+    live_parts.extend(str(x.get("content") or "") for x in live_q.get("choices", []) if isinstance(x, dict))
+    live_parts.extend(str(x) for x in live_q.get("hints", []) if x)
+    live_parts.extend(str(x.get("code") or "") for x in live_q.get("descriptions", []) if isinstance(x, dict))
+    db_parts = [dbrow.get("question", "")]
+    db_parts.extend(str(x.get("content") or "") for x in dbrow.get("choices", []) if isinstance(x, dict))
+    db_parts.extend(str(x) for x in dbrow.get("hints", []) if x)
+    db_parts.extend(str(x) for x in dbrow.get("starter_code", []) if x)
+    live = norm(" ".join(live_parts))
+    candidate = norm(" ".join(db_parts))
+    if not live or not candidate:
+        return 0.0
+    a, b = set(live.split()), set(candidate.split())
+    jaccard = len(a & b) / max(1, len(a | b))
+    seq = difflib.SequenceMatcher(None, live, candidate).ratio()
+    # Token overlap is robust to reordered text; sequence ratio helps distinguish near-duplicates.
+    return 0.65 * jaccard + 0.35 * seq
+
+
+def find_dbrow_for_question(q, chapter_id, db, used_db_ids=None):
+    """Find a unique same-chapter bank row by content, regardless of question ID/order."""
+    used_db_ids = used_db_ids or set()
+    candidates = []
+    for (cid, bank_qid), row in db.items():
+        if cid != str(chapter_id) or str(bank_qid) in used_db_ids:
+            continue
+        score = content_similarity(q, row)
+        # Exact ID is only a tie-breaker; it never overrides a better content match.
+        candidates.append((score, str(bank_qid) == str(q.get("id")), str(bank_qid), row))
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    if not candidates:
+        return None, "no_candidate_in_chapter", 0.0
+    best = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else 0.0
+    # Conservative threshold + separation guard prevent accidental cross-question answers.
+    if best[0] < 0.58:
+        return None, "no_confident_content_match", best[0]
+    if best[0] - second_score < 0.055:
+        return None, "ambiguous_content_match", best[0]
+    return best[3], "content_match", best[0]
 
 
 def write(name, value):
@@ -133,6 +178,18 @@ def extract_description_answer(dbrow):
                 if len(candidate) <= 2000 and not re.search(r"[\u0600-\u06ff]|https?://", candidate):
                     return candidate
 
+    # Explicit final-code wording: accept the complete code block after "ليصبح الكود هكذا".
+    m = re.search(r"(?:ليصبح|ليكون)\s+(?:الكود|البرنامج)\s+(?:هكذا|كما يلي)\s*[:：]?\s*\n+([\s\S]*?)(?=\n\s*(?:الف مبروك|لو محتاج|حل المستوى|ملاحظة)|$)", raw, re.I)
+    if m:
+        lines = [x.strip().strip('`') for x in m.group(1).splitlines() if x.strip()]
+        if lines and len(lines) <= 30 and all(
+            len(x) <= 500 and not re.search(r"[\u0600-\u06ff]|https?://", x)
+            for x in lines
+        ):
+            candidate = "\n".join(lines)
+            if re.search(r"[;{}()=+*/]|^//", candidate, re.M):
+                return candidate
+
     # Explicit ordered fill-in list. Return newline-separated fragments only
     # when the source clearly labels the list and every extracted line is code.
     m = re.search(r"نكتب\s+النواقص\s+في\s+الاسطر\s+هكذا\s+بالترتيب\s*[:：]?\s*\n+([\s\S]*?)(?=\n\s*(?:ليصبح|شكل الكود النهائي|الف مبروك|لو محتاج|حل المستوى)|$)", raw, re.I)
@@ -176,7 +233,7 @@ def exact_description_solution(q, dbrow):
     checked as a guard against a changed/recycled question ID. The returned value
     is the complete editor buffer, not merely the inserted fragment.
     """
-    qid = str(q.get("id"))
+    qid = str(dbrow.get("question_id") or q.get("id"))
     content = norm(q.get("content", ""))
     starter = live_description_code(q)
     expected = {
@@ -230,7 +287,9 @@ def pick_answer(q, dbrow):
             value = re.sub(r"<[^>]+>", "", value)
             return re.sub(r"\s+", " ", value).strip().casefold()
 
-        target = choice_key(dbrow.get("matched_choice") or answer)
+        # The reference bank's matched_choice field can conflict with its answer text.
+        # Prefer the explicit suggested_answer and never silently override it with a conflicting field.
+        target = choice_key(answer)
         exact = [c for c in choices if target and choice_key(c.get("content")) == target]
         if len(exact) == 1 and exact[0].get("id") is not None:
             return {"kind": "choice", "choice_id": int(exact[0]["id"]), "answer": answer,
@@ -370,11 +429,16 @@ def solve_assessment(session, chapter, db, submit=True, retake=False):
         print(f"[ASSESSMENT-RESUME] {cid}: استكمال المحاولة الحالية بدون إعادة فتح التقييم.")
 
     details, unresolved, sent = [], [], []
+    used_db_ids = set()
     for q in questions:
-        dbrow = db.get((cid, q["id"]))
+        dbrow, match_reason, match_score = find_dbrow_for_question(q, cid, db, used_db_ids)
+        if dbrow:
+            used_db_ids.add(str(dbrow.get("question_id")))
         answer, reason = pick_answer(q, dbrow)
         record = {"question_id": q["id"], "question": q["content"], "type": q["type"],
-                  "match": reason, "answer_source": (dbrow or {}).get("answer_source"),
+                  "match": reason, "bank_question_id": (dbrow or {}).get("question_id"),
+                  "content_match": match_reason, "content_match_score": round(match_score, 3),
+                  "answer_source": (dbrow or {}).get("answer_source"),
                   "source_verification": (dbrow or {}).get("source_verification")}
         if not answer:
             unresolved.append(record)
